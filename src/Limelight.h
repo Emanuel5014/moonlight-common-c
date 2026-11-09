@@ -483,6 +483,16 @@ typedef void(*ConnListenerSetAdaptiveTriggers)(uint16_t controllerNumber, uint8_
 // This callback is invoked to set a controller's RGB LED (if present).
 typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b);
 
+// streamfork extension: this callback is invoked when the host pushes its clipboard content
+// (see LiSetStreamforkCapabilities()). The data is only valid for the duration of the callback.
+// Text (LI_CLIPBOARD_TEXT) is UTF-8 with LF line endings and no null terminator.
+typedef void(*ConnListenerClipboardReceived)(uint8_t format, const void* data, uint32_t length);
+
+// streamfork extension: this callback is invoked when the host acknowledges the streamfork
+// extensions requested with LiSetStreamforkCapabilities(). It is never invoked by hosts that
+// don't support them. The capabilities are the same as LiGetStreamforkCapabilities().
+typedef void(*ConnListenerStreamforkReady)(uint32_t capabilities);
+
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
     ConnListenerStageComplete stageComplete;
@@ -497,6 +507,8 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerSetMotionEventState setMotionEventState;
     ConnListenerSetControllerLED setControllerLED;
     ConnListenerSetAdaptiveTriggers setAdaptiveTriggers;
+    ConnListenerClipboardReceived clipboardReceived;
+    ConnListenerStreamforkReady streamforkReady;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
 // Use this function to zero the connection callbacks when allocated on the stack or heap
@@ -1017,6 +1029,32 @@ void LiRequestIdrFrame(void);
 #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
 #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
 uint32_t LiGetHostFeatureFlags(void);
+
+// streamfork protocol extensions. They are negotiated at the start of the control stream:
+// the client announces the capabilities it wants and the host answers with the subset it
+// allows for this client (taking its permissions into account). Hosts that don't know
+// the extensions ignore the request, so nothing changes with them.
+#define STREAMFORK_CAP_CLIPBOARD_TEXT      0x00000001 // Plain text clipboard sync
+#define STREAMFORK_CAP_CLIPBOARD_IMAGE     0x00000002 // PNG image clipboard sync
+#define STREAMFORK_CAP_CLIPBOARD_TO_CLIENT 0x00000100 // The host pushes its clipboard to the client
+#define STREAMFORK_CAP_CLIPBOARD_TO_HOST   0x00000200 // The client may push its clipboard to the host
+
+#define LI_CLIPBOARD_TEXT 1 // UTF-8 text with LF line endings
+#define LI_CLIPBOARD_PNG  2
+
+// Sets the streamfork capabilities to request from the host. This must be called before
+// LiStartConnection() and stays in effect for later connections. 0 (the default) disables
+// the extensions entirely, so no streamfork messages are sent.
+void LiSetStreamforkCapabilities(uint32_t capabilities);
+
+// Returns the streamfork capabilities negotiated with the host for the current connection,
+// or 0 if the host hasn't acknowledged them (yet).
+uint32_t LiGetStreamforkCapabilities(void);
+
+// Pushes clipboard content to the host. It is thread-safe and returns LI_ERR_UNSUPPORTED
+// if the format and STREAMFORK_CAP_CLIPBOARD_TO_HOST were not negotiated with the host.
+// Text is limited to 1 MiB and images to 16 MiB (-2 is returned beyond that).
+int LiSendClipboard(uint8_t format, const void* data, uint32_t length);
 
 #ifdef __cplusplus
 }

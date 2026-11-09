@@ -94,6 +94,14 @@ typedef struct _QUEUED_ASYNC_CALLBACK {
             uint8_t left[DS_EFFECT_PAYLOAD_SIZE];
             uint8_t right[DS_EFFECT_PAYLOAD_SIZE];
         } dsAdaptiveTrigger;
+        struct {
+            uint8_t format;
+            uint32_t length;
+            uint8_t* data; // Allocated together with the QUEUED_ASYNC_CALLBACK (right after it)
+        } sfClipboard;
+        struct {
+            uint32_t capabilities;
+        } sfReady;
     } data;
     LINKED_BLOCKING_QUEUE_ENTRY entry;
 } QUEUED_ASYNC_CALLBACK, *PQUEUED_ASYNC_CALLBACK;
@@ -154,6 +162,37 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 
 #define CONTROL_STREAM_TIMEOUT_SEC 10
 #define CONTROL_STREAM_LINGER_TIMEOUT_SEC 2
+
+// streamfork protocol extensions (range 0x3100-0x31FF). Integers are little-endian.
+//   Hello (C->H):         u8 version, u32 requested capabilities
+//   HelloAck (H->C):      u8 version, u32 granted capabilities
+//   Clipboard (both):     u8 format, u32 transferId, u32 totalLength, u32 offset, data[]
+#define SF_PTYPE_CLIPBOARD_H2C 0x3100
+#define SF_PTYPE_CLIPBOARD_C2H 0x3101
+#define SF_PTYPE_HELLO         0x3102
+#define SF_PTYPE_HELLO_ACK     0x3103
+#define SF_PROTOCOL_VERSION    1
+
+#define SF_CLIPBOARD_HEADER_SIZE (1 + 4 + 4 + 4)
+#define SF_CLIPBOARD_MAX_CHUNK   (32 * 1024)
+#define SF_CLIPBOARD_MAX_TEXT    (1024 * 1024)
+#define SF_CLIPBOARD_MAX_IMAGE   (16 * 1024 * 1024)
+
+// Async callback types for streamfork messages (outside the range of the IDX_* values)
+#define IDX_SF_CLIPBOARD 100
+#define IDX_SF_READY     101
+
+static uint32_t sfRequestedCapabilities;
+static volatile uint32_t sfNegotiatedCapabilities;
+static PLT_MUTEX sfClipboardSendMutex;
+static uint32_t sfClipboardSendTransferId;
+
+// Clipboard transfer being received from the host (only touched by the receive thread)
+static struct {
+    uint32_t transferId;
+    uint32_t received;
+    PQUEUED_ASYNC_CALLBACK queuedCb; // NULL when no transfer is in progress or it's being ignored
+} sfClipboardRecv;
 
 static const short packetTypesGen3[] = {
     0x1407, // Request IDR frame
@@ -320,6 +359,10 @@ int initializeControlStream(void) {
     LbqInitializeLinkedBlockingQueue(&frameFecStatusQueue, 8); // Limits number of frame status reports per periodic ping interval
     LbqInitializeLinkedBlockingQueue(&asyncCallbackQueue, 30);
     PltCreateMutex(&enetMutex);
+    PltCreateMutex(&sfClipboardSendMutex);
+    sfNegotiatedCapabilities = 0;
+    sfClipboardSendTransferId = 0;
+    memset(&sfClipboardRecv, 0, sizeof(sfClipboardRecv));
 
     encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
 
@@ -395,6 +438,10 @@ void destroyControlStream(void) {
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&frameFecStatusQueue));
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&asyncCallbackQueue));
 
+    free(sfClipboardRecv.queuedCb);
+    sfClipboardRecv.queuedCb = NULL;
+
+    PltDeleteMutex(&sfClipboardSendMutex);
     PltDeleteMutex(&enetMutex);
 }
 
@@ -1183,6 +1230,14 @@ static void asyncCallbackThreadFunc(void* context) {
                                                   queuedCb->data.dsAdaptiveTrigger.left,
                                                   queuedCb->data.dsAdaptiveTrigger.right);
             break;
+        case IDX_SF_CLIPBOARD:
+            ListenerCallbacks.clipboardReceived(queuedCb->data.sfClipboard.format,
+                                                queuedCb->data.sfClipboard.data,
+                                                queuedCb->data.sfClipboard.length);
+            break;
+        case IDX_SF_READY:
+            ListenerCallbacks.streamforkReady(queuedCb->data.sfReady.capabilities);
+            break;
         default:
             // Unhandled packet type from queueAsyncCallback()
             LC_ASSERT(false);
@@ -1272,6 +1327,214 @@ static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLe
         Limelog("Failed to queue async callback: %d\n", err);
         free(queuedCb);
     }
+}
+
+static bool isStreamforkMessage(unsigned short packetType) {
+    return packetType == SF_PTYPE_HELLO_ACK || packetType == SF_PTYPE_CLIPBOARD_H2C;
+}
+
+static void queueStreamforkCallback(PQUEUED_ASYNC_CALLBACK queuedCb) {
+    int err = LbqOfferQueueItem(&asyncCallbackQueue, queuedCb, &queuedCb->entry);
+    if (err != LBQ_SUCCESS) {
+        Limelog("Failed to queue streamfork callback: %d\n", err);
+        free(queuedCb);
+    }
+}
+
+static void handleStreamforkMessage(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLength) {
+    BYTE_BUFFER bb;
+
+    BbInitializeWrappedBuffer(&bb, (char*)ctlHdr, sizeof(*ctlHdr), packetLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
+
+    if (ctlHdr->type == SF_PTYPE_HELLO_ACK) {
+        PQUEUED_ASYNC_CALLBACK queuedCb;
+        uint8_t version;
+        uint32_t capabilities;
+
+        if (!BbGet8(&bb, &version) || !BbGet32(&bb, &capabilities)) {
+            Limelog("Discarding runt streamfork HelloAck\n");
+            return;
+        }
+
+        // Never enable anything we didn't ask for
+        capabilities &= sfRequestedCapabilities;
+        sfNegotiatedCapabilities = capabilities;
+        Limelog("streamfork extensions enabled by host (version %u): 0x%08x\n", version, capabilities);
+
+        queuedCb = malloc(sizeof(*queuedCb));
+        if (queuedCb != NULL) {
+            queuedCb->typeIndex = IDX_SF_READY;
+            queuedCb->data.sfReady.capabilities = capabilities;
+            queueStreamforkCallback(queuedCb);
+        }
+    }
+    else if (ctlHdr->type == SF_PTYPE_CLIPBOARD_H2C) {
+        uint8_t format;
+        uint32_t transferId, totalLength, offset, chunkLength;
+
+        if (!(sfNegotiatedCapabilities & STREAMFORK_CAP_CLIPBOARD_TO_CLIENT)) {
+            Limelog("Discarding clipboard data that was not negotiated\n");
+            return;
+        }
+
+        if (!BbGet8(&bb, &format) || !BbGet32(&bb, &transferId) ||
+                !BbGet32(&bb, &totalLength) || !BbGet32(&bb, &offset)) {
+            Limelog("Discarding runt clipboard packet\n");
+            return;
+        }
+        chunkLength = (uint32_t)(packetLength - sizeof(*ctlHdr) - SF_CLIPBOARD_HEADER_SIZE);
+
+        // A new transfer replaces any incomplete one
+        if (offset == 0 || transferId != sfClipboardRecv.transferId) {
+            uint32_t formatCapability, maxLength;
+
+            free(sfClipboardRecv.queuedCb);
+            sfClipboardRecv.queuedCb = NULL;
+            sfClipboardRecv.transferId = transferId;
+            sfClipboardRecv.received = 0;
+
+            if (offset != 0) {
+                // We missed the start of this transfer, so ignore the rest of it
+                return;
+            }
+
+            switch (format) {
+            case LI_CLIPBOARD_TEXT:
+                formatCapability = STREAMFORK_CAP_CLIPBOARD_TEXT;
+                maxLength = SF_CLIPBOARD_MAX_TEXT;
+                break;
+            case LI_CLIPBOARD_PNG:
+                formatCapability = STREAMFORK_CAP_CLIPBOARD_IMAGE;
+                maxLength = SF_CLIPBOARD_MAX_IMAGE;
+                break;
+            default:
+                formatCapability = 0;
+                maxLength = 0;
+                break;
+            }
+
+            if (!(sfNegotiatedCapabilities & formatCapability) || totalLength > maxLength) {
+                Limelog("Ignoring clipboard transfer (format %u, %u bytes)\n", format, totalLength);
+                return;
+            }
+
+            sfClipboardRecv.queuedCb = malloc(sizeof(*sfClipboardRecv.queuedCb) + totalLength);
+            if (sfClipboardRecv.queuedCb == NULL) {
+                return;
+            }
+
+            sfClipboardRecv.queuedCb->typeIndex = IDX_SF_CLIPBOARD;
+            sfClipboardRecv.queuedCb->data.sfClipboard.format = format;
+            sfClipboardRecv.queuedCb->data.sfClipboard.length = totalLength;
+            sfClipboardRecv.queuedCb->data.sfClipboard.data = (uint8_t*)(sfClipboardRecv.queuedCb + 1);
+        }
+
+        // Nothing to do if this transfer is being ignored
+        if (sfClipboardRecv.queuedCb == NULL) {
+            return;
+        }
+
+        // Chunks arrive in order on the reliable channel
+        if (offset != sfClipboardRecv.received ||
+                chunkLength > sfClipboardRecv.queuedCb->data.sfClipboard.length - sfClipboardRecv.received) {
+            Limelog("Discarding invalid clipboard chunk (offset %u, %u bytes)\n", offset, chunkLength);
+            free(sfClipboardRecv.queuedCb);
+            sfClipboardRecv.queuedCb = NULL;
+            return;
+        }
+
+        BbGetBytes(&bb, sfClipboardRecv.queuedCb->data.sfClipboard.data + offset, (int)chunkLength);
+        sfClipboardRecv.received += chunkLength;
+
+        if (sfClipboardRecv.received == sfClipboardRecv.queuedCb->data.sfClipboard.length) {
+            // The async callback queue takes ownership of the completed transfer
+            queueStreamforkCallback(sfClipboardRecv.queuedCb);
+            sfClipboardRecv.queuedCb = NULL;
+        }
+    }
+}
+
+static void sendStreamforkHello(void) {
+    char payload[1 + 4];
+    BYTE_BUFFER bb;
+
+    BbInitializeWrappedBuffer(&bb, payload, 0, sizeof(payload), BYTE_ORDER_LITTLE);
+    BbPut8(&bb, SF_PROTOCOL_VERSION);
+    BbPut32(&bb, sfRequestedCapabilities);
+
+    if (!sendMessageAndForget(SF_PTYPE_HELLO, sizeof(payload), payload, CTRL_CHANNEL_GENERIC, ENET_PACKET_FLAG_RELIABLE, false)) {
+        Limelog("Failed to send streamfork Hello\n");
+    }
+}
+
+void LiSetStreamforkCapabilities(uint32_t capabilities) {
+    sfRequestedCapabilities = capabilities;
+}
+
+uint32_t LiGetStreamforkCapabilities(void) {
+    return sfNegotiatedCapabilities;
+}
+
+int LiSendClipboard(uint8_t format, const void* data, uint32_t length) {
+    uint32_t requiredCapabilities, maxLength, offset;
+    uint8_t* packet;
+    int err = 0;
+
+    switch (format) {
+    case LI_CLIPBOARD_TEXT:
+        requiredCapabilities = STREAMFORK_CAP_CLIPBOARD_TEXT | STREAMFORK_CAP_CLIPBOARD_TO_HOST;
+        maxLength = SF_CLIPBOARD_MAX_TEXT;
+        break;
+    case LI_CLIPBOARD_PNG:
+        requiredCapabilities = STREAMFORK_CAP_CLIPBOARD_IMAGE | STREAMFORK_CAP_CLIPBOARD_TO_HOST;
+        maxLength = SF_CLIPBOARD_MAX_IMAGE;
+        break;
+    default:
+        return LI_ERR_UNSUPPORTED;
+    }
+
+    if (stopping || (sfNegotiatedCapabilities & requiredCapabilities) != requiredCapabilities) {
+        return LI_ERR_UNSUPPORTED;
+    }
+
+    if (length > maxLength) {
+        return -2;
+    }
+
+    packet = malloc(SF_CLIPBOARD_HEADER_SIZE + MIN(length, SF_CLIPBOARD_MAX_CHUNK));
+    if (packet == NULL) {
+        return -1;
+    }
+
+    // Serialize transfers so their chunks never interleave
+    PltLockMutex(&sfClipboardSendMutex);
+
+    uint32_t transferId = sfClipboardSendTransferId++;
+    offset = 0;
+    do {
+        uint32_t chunkLength = MIN(length - offset, SF_CLIPBOARD_MAX_CHUNK);
+        BYTE_BUFFER bb;
+
+        BbInitializeWrappedBuffer(&bb, (char*)packet, 0, SF_CLIPBOARD_HEADER_SIZE + chunkLength, BYTE_ORDER_LITTLE);
+        BbPut8(&bb, format);
+        BbPut32(&bb, transferId);
+        BbPut32(&bb, length);
+        BbPut32(&bb, offset);
+        BbPutBytes(&bb, (const uint8_t*)data + offset, (int)chunkLength);
+
+        if (!sendMessageAndForget(SF_PTYPE_CLIPBOARD_C2H, SF_CLIPBOARD_HEADER_SIZE + chunkLength, packet,
+                                  CTRL_CHANNEL_GENERIC, ENET_PACKET_FLAG_RELIABLE, offset + chunkLength < length)) {
+            err = -1;
+            break;
+        }
+
+        offset += chunkLength;
+    } while (offset < length);
+
+    PltUnlockMutex(&sfClipboardSendMutex);
+
+    free(packet);
+    return err;
 }
 
 static void controlReceiveThreadFunc(void* context) {
@@ -1491,7 +1754,10 @@ static void controlReceiveThreadFunc(void* context) {
             }
 
             // Process client callbacks in a separate thread
-            if (needsAsyncCallback(ctlHdr->type)) {
+            if (isStreamforkMessage(ctlHdr->type)) {
+                handleStreamforkMessage(ctlHdr, packetLength);
+            }
+            else if (needsAsyncCallback(ctlHdr->type)) {
                 queueAsyncCallback(ctlHdr, packetLength);
             }
             else if (ctlHdr->type == packetTypes[IDX_TERMINATION]) {
@@ -1840,6 +2106,7 @@ static void requestIdrFrameFunc(void* context) {
 // Stops the control stream
 int stopControlStream(void) {
     stopping = true;
+    sfNegotiatedCapabilities = 0;
     LbqSignalQueueShutdown(&referenceFrameControlQueue);
     LbqSignalQueueShutdown(&frameFecStatusQueue);
     LbqSignalQueueDrain(&asyncCallbackQueue);
@@ -2265,6 +2532,11 @@ int startControlStream(void) {
 
             return err;
         }
+    }
+
+    // Announce the streamfork extensions we want. Hosts that don't support them ignore this.
+    if (IS_SUNSHINE() && sfRequestedCapabilities != 0) {
+        sendStreamforkHello();
     }
 
     return 0;
