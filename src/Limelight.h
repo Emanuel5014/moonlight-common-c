@@ -493,6 +493,20 @@ typedef void(*ConnListenerClipboardReceived)(uint8_t format, const void* data, u
 // don't support them. The capabilities are the same as LiGetStreamforkCapabilities().
 typedef void(*ConnListenerStreamforkReady)(uint32_t capabilities);
 
+// streamfork extension (STREAMFORK_CAP_LOCAL_CURSOR): this callback is invoked when the host sends
+// a cursor shape. shapeId is never 0. The image is width * height pixels in BGRA byte order
+// (straight, non-premultiplied alpha, no row padding) and is only valid for the duration of the
+// callback. The client should keep at least the LI_CURSOR_MIN_CACHED_SHAPES most recently used
+// shapes, since the host only sends a shape again when it thinks the client no longer has it.
+typedef void(*ConnListenerCursorShape)(uint32_t shapeId, uint16_t width, uint16_t height,
+                                       uint16_t hotX, uint16_t hotY, const void* bgra);
+
+// streamfork extension (STREAMFORK_CAP_LOCAL_CURSOR): this callback is invoked when the host cursor
+// changes shape or visibility while the local cursor is active (see LiSetLocalCursorActive()).
+// shapeId 0 means the host can't provide the shape right now (e.g. it's too large) and draws the
+// cursor in the video as usual, so the client should not draw its own.
+typedef void(*ConnListenerCursorState)(bool visible, uint32_t shapeId);
+
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
     ConnListenerStageComplete stageComplete;
@@ -509,6 +523,8 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerSetAdaptiveTriggers setAdaptiveTriggers;
     ConnListenerClipboardReceived clipboardReceived;
     ConnListenerStreamforkReady streamforkReady;
+    ConnListenerCursorShape cursorShape;
+    ConnListenerCursorState cursorState;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
 // Use this function to zero the connection callbacks when allocated on the stack or heap
@@ -1038,6 +1054,8 @@ uint32_t LiGetHostFeatureFlags(void);
 #define STREAMFORK_CAP_CLIPBOARD_IMAGE     0x00000002 // PNG image clipboard sync
 #define STREAMFORK_CAP_CLIPBOARD_TO_CLIENT 0x00000100 // The host pushes its clipboard to the client
 #define STREAMFORK_CAP_CLIPBOARD_TO_HOST   0x00000200 // The client may push its clipboard to the host
+// 0x00010000 is reserved for the adaptive bitrate extension
+#define STREAMFORK_CAP_LOCAL_CURSOR        0x00020000 // The host sends its cursor shape for a client-drawn cursor
 
 #define LI_CLIPBOARD_TEXT 1 // UTF-8 text with LF line endings
 #define LI_CLIPBOARD_PNG  2
@@ -1055,6 +1073,18 @@ uint32_t LiGetStreamforkCapabilities(void);
 // if the format and STREAMFORK_CAP_CLIPBOARD_TO_HOST were not negotiated with the host.
 // Text is limited to 1 MiB and images to 16 MiB (-2 is returned beyond that).
 int LiSendClipboard(uint8_t format, const void* data, uint32_t length);
+
+// Local cursor (STREAMFORK_CAP_LOCAL_CURSOR): cursor shapes are at most LI_CURSOR_MAX_SIZE pixels
+// on each side, and the client keeps at least LI_CURSOR_MIN_CACHED_SHAPES of them.
+#define LI_CURSOR_MAX_SIZE          256
+#define LI_CURSOR_MIN_CACHED_SHAPES 32
+
+// Tells the host whether the client is drawing the host cursor locally (with the shapes received
+// through the cursorShape and cursorState callbacks). While it is active, the host stops drawing
+// the cursor in the video and reports cursor changes; it starts inactive for every connection.
+// It is thread-safe and returns LI_ERR_UNSUPPORTED if STREAMFORK_CAP_LOCAL_CURSOR was not
+// negotiated with the host.
+int LiSetLocalCursorActive(bool active);
 
 #ifdef __cplusplus
 }

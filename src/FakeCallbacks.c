@@ -43,6 +43,8 @@ static void fakeClSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFl
 static void fakeClSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b) {}
 static void fakeClClipboardReceived(uint8_t format, const void* data, uint32_t length) {}
 static void fakeClStreamforkReady(uint32_t capabilities) {}
+static void fakeClCursorShape(uint32_t shapeId, uint16_t width, uint16_t height, uint16_t hotX, uint16_t hotY, const void* bgra) {}
+static void fakeClCursorState(bool visible, uint32_t shapeId) {}
 
 static CONNECTION_LISTENER_CALLBACKS fakeClCallbacks = {
     .stageStarting = fakeClStageStarting,
@@ -60,6 +62,8 @@ static CONNECTION_LISTENER_CALLBACKS fakeClCallbacks = {
     .setAdaptiveTriggers = fakeClSetAdaptiveTriggers,
     .clipboardReceived = fakeClClipboardReceived,
     .streamforkReady = fakeClStreamforkReady,
+    .cursorShape = fakeClCursorShape,
+    .cursorState = fakeClCursorState,
 };
 
 void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_RENDERER_CALLBACKS* arCallbacks,
@@ -155,6 +159,12 @@ void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_REND
         }
         if ((*clCallbacks)->streamforkReady == NULL) {
             (*clCallbacks)->streamforkReady = fakeClStreamforkReady;
+        }
+        if ((*clCallbacks)->cursorShape == NULL) {
+            (*clCallbacks)->cursorShape = fakeClCursorShape;
+        }
+        if ((*clCallbacks)->cursorState == NULL) {
+            (*clCallbacks)->cursorState = fakeClCursorState;
         }
     }
 }

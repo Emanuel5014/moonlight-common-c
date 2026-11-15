@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "StreamforkCursor.h"
 
 // This is a private header, but it just contains some time macros
 #include <enet/time.h>
@@ -102,6 +103,18 @@ typedef struct _QUEUED_ASYNC_CALLBACK {
         struct {
             uint32_t capabilities;
         } sfReady;
+        struct {
+            uint32_t shapeId;
+            uint16_t width;
+            uint16_t height;
+            uint16_t hotX;
+            uint16_t hotY;
+            uint8_t* bgra; // Allocated together with the QUEUED_ASYNC_CALLBACK (right after it)
+        } sfCursorShape;
+        struct {
+            bool visible;
+            uint32_t shapeId;
+        } sfCursorState;
     } data;
     LINKED_BLOCKING_QUEUE_ENTRY entry;
 } QUEUED_ASYNC_CALLBACK, *PQUEUED_ASYNC_CALLBACK;
@@ -167,10 +180,16 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 //   Hello (C->H):         u8 version, u32 requested capabilities
 //   HelloAck (H->C):      u8 version, u32 granted capabilities
 //   Clipboard (both):     u8 format, u32 transferId, u32 totalLength, u32 offset, data[]
+//   CursorShape (H->C):   see StreamforkCursor.h
+//   CursorState (H->C):   u8 visible, u32 shapeId
+//   CursorMode (C->H):    u8 local cursor active
 #define SF_PTYPE_CLIPBOARD_H2C 0x3100
 #define SF_PTYPE_CLIPBOARD_C2H 0x3101
 #define SF_PTYPE_HELLO         0x3102
 #define SF_PTYPE_HELLO_ACK     0x3103
+#define SF_PTYPE_CURSOR_SHAPE  0x3106
+#define SF_PTYPE_CURSOR_STATE  0x3107
+#define SF_PTYPE_CURSOR_MODE   0x3108
 #define SF_PROTOCOL_VERSION    1
 
 #define SF_CLIPBOARD_HEADER_SIZE (1 + 4 + 4 + 4)
@@ -181,6 +200,8 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 // Async callback types for streamfork messages (outside the range of the IDX_* values)
 #define IDX_SF_CLIPBOARD 100
 #define IDX_SF_READY     101
+#define IDX_SF_CURSOR_SHAPE 102
+#define IDX_SF_CURSOR_STATE 103
 
 static uint32_t sfRequestedCapabilities;
 static volatile uint32_t sfNegotiatedCapabilities;
@@ -193,6 +214,9 @@ static struct {
     uint32_t received;
     PQUEUED_ASYNC_CALLBACK queuedCb; // NULL when no transfer is in progress or it's being ignored
 } sfClipboardRecv;
+
+// Cursor shape being received from the host (only touched by the receive thread)
+static SF_CURSOR_SHAPE_RECV sfCursorShapeRecv;
 
 static const short packetTypesGen3[] = {
     0x1407, // Request IDR frame
@@ -363,6 +387,7 @@ int initializeControlStream(void) {
     sfNegotiatedCapabilities = 0;
     sfClipboardSendTransferId = 0;
     memset(&sfClipboardRecv, 0, sizeof(sfClipboardRecv));
+    memset(&sfCursorShapeRecv, 0, sizeof(sfCursorShapeRecv));
 
     encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
 
@@ -440,6 +465,7 @@ void destroyControlStream(void) {
 
     free(sfClipboardRecv.queuedCb);
     sfClipboardRecv.queuedCb = NULL;
+    sfCursorShapeReset(&sfCursorShapeRecv);
 
     PltDeleteMutex(&sfClipboardSendMutex);
     PltDeleteMutex(&enetMutex);
@@ -1238,6 +1264,18 @@ static void asyncCallbackThreadFunc(void* context) {
         case IDX_SF_READY:
             ListenerCallbacks.streamforkReady(queuedCb->data.sfReady.capabilities);
             break;
+        case IDX_SF_CURSOR_SHAPE:
+            ListenerCallbacks.cursorShape(queuedCb->data.sfCursorShape.shapeId,
+                                          queuedCb->data.sfCursorShape.width,
+                                          queuedCb->data.sfCursorShape.height,
+                                          queuedCb->data.sfCursorShape.hotX,
+                                          queuedCb->data.sfCursorShape.hotY,
+                                          queuedCb->data.sfCursorShape.bgra);
+            break;
+        case IDX_SF_CURSOR_STATE:
+            ListenerCallbacks.cursorState(queuedCb->data.sfCursorState.visible,
+                                          queuedCb->data.sfCursorState.shapeId);
+            break;
         default:
             // Unhandled packet type from queueAsyncCallback()
             LC_ASSERT(false);
@@ -1330,7 +1368,8 @@ static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLe
 }
 
 static bool isStreamforkMessage(unsigned short packetType) {
-    return packetType == SF_PTYPE_HELLO_ACK || packetType == SF_PTYPE_CLIPBOARD_H2C;
+    return packetType == SF_PTYPE_HELLO_ACK || packetType == SF_PTYPE_CLIPBOARD_H2C ||
+           packetType == SF_PTYPE_CURSOR_SHAPE || packetType == SF_PTYPE_CURSOR_STATE;
 }
 
 static void queueStreamforkCallback(PQUEUED_ASYNC_CALLBACK queuedCb) {
@@ -1452,6 +1491,63 @@ static void handleStreamforkMessage(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int pac
             sfClipboardRecv.queuedCb = NULL;
         }
     }
+    else if (ctlHdr->type == SF_PTYPE_CURSOR_SHAPE) {
+        PQUEUED_ASYNC_CALLBACK queuedCb;
+        int result;
+
+        if (!(sfNegotiatedCapabilities & STREAMFORK_CAP_LOCAL_CURSOR)) {
+            Limelog("Discarding cursor shape that was not negotiated\n");
+            return;
+        }
+
+        result = sfCursorShapeReceiveChunk(&sfCursorShapeRecv, (const uint8_t*)(ctlHdr + 1),
+                                           (uint32_t)(packetLength - sizeof(*ctlHdr)));
+        if (result == SF_CURSOR_CHUNK_INVALID) {
+            Limelog("Discarding invalid cursor shape chunk\n");
+            return;
+        }
+        else if (result != SF_CURSOR_CHUNK_COMPLETE) {
+            return;
+        }
+
+        queuedCb = malloc(sizeof(*queuedCb) + sfCursorShapeRecv.totalLength);
+        if (queuedCb != NULL) {
+            queuedCb->typeIndex = IDX_SF_CURSOR_SHAPE;
+            queuedCb->data.sfCursorShape.shapeId = sfCursorShapeRecv.shapeId;
+            queuedCb->data.sfCursorShape.width = sfCursorShapeRecv.width;
+            queuedCb->data.sfCursorShape.height = sfCursorShapeRecv.height;
+            queuedCb->data.sfCursorShape.hotX = sfCursorShapeRecv.hotX;
+            queuedCb->data.sfCursorShape.hotY = sfCursorShapeRecv.hotY;
+            queuedCb->data.sfCursorShape.bgra = (uint8_t*)(queuedCb + 1);
+            memcpy(queuedCb->data.sfCursorShape.bgra, sfCursorShapeRecv.data, sfCursorShapeRecv.totalLength);
+            queueStreamforkCallback(queuedCb);
+        }
+
+        sfCursorShapeReset(&sfCursorShapeRecv);
+    }
+    else if (ctlHdr->type == SF_PTYPE_CURSOR_STATE) {
+        PQUEUED_ASYNC_CALLBACK queuedCb;
+        uint8_t visible;
+        uint32_t shapeId;
+
+        if (!(sfNegotiatedCapabilities & STREAMFORK_CAP_LOCAL_CURSOR)) {
+            Limelog("Discarding cursor state that was not negotiated\n");
+            return;
+        }
+
+        if (!BbGet8(&bb, &visible) || !BbGet32(&bb, &shapeId)) {
+            Limelog("Discarding runt cursor state\n");
+            return;
+        }
+
+        queuedCb = malloc(sizeof(*queuedCb));
+        if (queuedCb != NULL) {
+            queuedCb->typeIndex = IDX_SF_CURSOR_STATE;
+            queuedCb->data.sfCursorState.visible = visible != 0;
+            queuedCb->data.sfCursorState.shapeId = shapeId;
+            queueStreamforkCallback(queuedCb);
+        }
+    }
 }
 
 static void sendStreamforkHello(void) {
@@ -1473,6 +1569,20 @@ void LiSetStreamforkCapabilities(uint32_t capabilities) {
 
 uint32_t LiGetStreamforkCapabilities(void) {
     return sfNegotiatedCapabilities;
+}
+
+int LiSetLocalCursorActive(bool active) {
+    uint8_t payload = active ? 1 : 0;
+
+    if (stopping || !(sfNegotiatedCapabilities & STREAMFORK_CAP_LOCAL_CURSOR)) {
+        return LI_ERR_UNSUPPORTED;
+    }
+
+    if (!sendMessageAndForget(SF_PTYPE_CURSOR_MODE, sizeof(payload), &payload, CTRL_CHANNEL_GENERIC, ENET_PACKET_FLAG_RELIABLE, false)) {
+        return -1;
+    }
+
+    return 0;
 }
 
 int LiSendClipboard(uint8_t format, const void* data, uint32_t length) {
