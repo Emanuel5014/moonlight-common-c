@@ -1056,6 +1056,9 @@ uint32_t LiGetHostFeatureFlags(void);
 #define STREAMFORK_CAP_CLIPBOARD_TO_HOST   0x00000200 // The client may push its clipboard to the host
 // 0x00010000 is reserved for the adaptive bitrate extension
 #define STREAMFORK_CAP_LOCAL_CURSOR        0x00020000 // The host sends its cursor shape for a client-drawn cursor
+// The client may upload files to the host (file drag & drop). The files travel over the host's
+// HTTPS server (/actions/upload/*), not over the control stream, so nothing else is needed here.
+#define STREAMFORK_CAP_FILE_UPLOAD         0x00040000
 
 #define LI_CLIPBOARD_TEXT 1 // UTF-8 text with LF line endings
 #define LI_CLIPBOARD_PNG  2
